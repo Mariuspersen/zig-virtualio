@@ -1,15 +1,19 @@
 const std = @import("std");
 const Io = std.Io;
 
-pub fn helloWorld(writer: *Io.Writer) !void {
-    try writer.print("Hello World\n", .{});
-}
+const Virtualized = @import("Virtualized.zig");
 
-test "GreetTheWorld" {
-    const io = std.testing.io;
+test "Test Init" {
     const alloc = std.testing.allocator;
-    const buf = try alloc.alloc(u8, 128);
+    const backing_io = std.testing.io;
+
+    const buf = try alloc.alloc(u8, 1024);
     defer alloc.free(buf);
-    var stdout = Io.File.stderr().writer(io, buf);
-    try helloWorld(&stdout.interface);
+    
+    var virtual = try Virtualized.init(alloc, backing_io);
+    defer virtual.deinit();
+
+    const io = virtual.io();
+    var locked = try io.lockStderr(buf, null);
+    try locked.file_writer.interface.print("Hello from Test Init", .{});
 }
