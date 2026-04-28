@@ -1,0 +1,7 @@
+# Virtual IO for Zig Interface
+A Zig IO implemention to sandbox file operations, might be useful for interacting with potentially malicious libraries or you just want the illusion of files stored in ram.
+
+## Idea in my head so far
+- All IO operations that would touch the disk go into ram, backed by a hash table maybe.
+- Everything else gets passed through to a real IO interface chosen by the consumer of the library
+- Maybe add some man in the middle code for the network part
