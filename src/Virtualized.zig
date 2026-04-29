@@ -22,15 +22,27 @@ const posix = std.posix;
 const windows = std.os.windows;
 const ws2_32 = windows.ws2_32;
 
+const FilesHashMap = std.StringHashMap(std.ArrayList(u8));
+const DirsHashMap = std.StringHashMap(Dir);
+const HandlesToFilesMap = std.AutoHashMap(Io.File.Handle, []const u8);
+const HandleMap = std.StringHashMap(Io.File.Handle);
+
+const CAPACITY_BUFFER_SIZE = 256;
+
 allocator: Allocator,
-files: std.AutoHashMap(File, Io.Writer.Allocating),
+files: FilesHashMap,
+dirs: DirsHashMap,
+handles: HandlesToFilesMap,
+reverse: HandleMap,
 count: i32,
 stderr_mode: Io.Terminal.Mode,
 stderr_buf: []u8,
 backing_io: Io,
 
-fn newHandle(v: *Virtualized) i32 {
-    return v.count;
+fn newHandle(v: *Virtualized) File.Handle {
+    v.count += 1;
+    const casted: usize = @intCast(v.count);
+    return @ptrFromInt(casted);
 }
 
 fn createFile(v: *Virtualized) File {
@@ -40,11 +52,13 @@ fn createFile(v: *Virtualized) File {
     };
 }
 
-fn createFilesEntry(v: *Virtualized) !void {
+fn createFilesEntry(v: *Virtualized) File {
+    const f = v.createFile();
     try v.files.put(
         v.createFile(),
         Io.Writer.Allocating.init(v.allocator),
     );
+    return f;
 }
 
 pub fn init(gpa: Allocator, backing_io: Io) !Virtualized {
@@ -52,17 +66,24 @@ pub fn init(gpa: Allocator, backing_io: Io) !Virtualized {
         .allocator = gpa,
         .backing_io = backing_io,
         .files = .init(gpa),
+        .dirs = .init(gpa),
+        .handles = .init(gpa),
+        .reverse = .init(gpa),
         .count = 2,
         .stderr_mode = .no_color,
-        .stderr_buf = try gpa.alloc(u8,1024),
+        .stderr_buf = try gpa.alloc(u8, 1024),
     };
 }
 
 pub fn deinit(v: *Virtualized) void {
     var it = v.files.valueIterator();
     while (it.next()) |writer| {
-        writer.deinit();
+        writer.deinit(v.allocator);
     }
+    v.dirs.deinit();
+    v.files.deinit();
+    v.handles.deinit();
+    v.reverse.deinit();
     v.allocator.free(v.stderr_buf);
 }
 
@@ -126,8 +147,8 @@ pub fn io(v: *Virtualized) Io {
             .fileLength = virtFileLength,
             .fileClose = virtFileClose,
             .fileWritePositional = virtFileWritePositional,
-            .fileWriteFileStreaming = noFileWriteFileStreaming,
-            .fileWriteFilePositional = noFileWriteFilePositional,
+            .fileWriteFileStreaming = virtFileWriteFileStreaming,
+            .fileWriteFilePositional = virtFileWriteFilePositional,
             .fileReadPositional = virtFileReadPositional,
             .fileSeekBy = virtFileSeekBy,
             .fileSeekTo = virtFileSeekTo,
@@ -418,11 +439,21 @@ pub fn virtDirAccess(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, opti
 }
 
 pub fn virtDirCreateFile(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, options: File.CreateFlags) File.OpenError!File {
-    _ = userdata;
-    _ = dir;
-    _ = sub_path;
-    _ = options;
-    return error.NoSpaceLeft;
+    const v: *Virtualized = @ptrCast(@alignCast(userdata));
+    // TODO: Figure out the best way of checking this
+    const handle = v.newHandle();
+    v.files.put(
+        sub_path,
+        std.ArrayList(u8).initCapacity(v.allocator, CAPACITY_BUFFER_SIZE) catch return error.NoSpaceLeft,
+    ) catch return error.NoSpaceLeft;
+    //UUHH This should not fail :))))
+    const hashed_sub_path = v.files.getKey(sub_path) orelse unreachable;
+    v.handles.put(handle, hashed_sub_path) catch return error.NoSpaceLeft;
+    v.reverse.put(hashed_sub_path, handle) catch return error.NoSpaceLeft;
+
+    const flags = File.OpenFlags{ .lock_nonblocking = options.lock_nonblocking };
+
+    return virtDirOpenFile(userdata, dir, sub_path, flags);
 }
 
 pub fn virtDirCreateFileAtomic(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, options: Dir.CreateFileAtomicOptions) Dir.CreateFileAtomicError!File.Atomic {
@@ -434,11 +465,27 @@ pub fn virtDirCreateFileAtomic(userdata: ?*anyopaque, dir: Dir, sub_path: []cons
 }
 
 pub fn virtDirOpenFile(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, flags: File.OpenFlags) File.OpenError!File {
-    _ = userdata;
+    // TODO: Figure out the best way of checking this
     _ = dir;
-    _ = sub_path;
-    _ = flags;
-    return error.FileNotFound;
+    const v: *Virtualized = @ptrCast(@alignCast(userdata));
+    //File doesn't exist
+    const hashed_sub_path = v.files.getKey(sub_path) orelse return error.FileNotFound;
+
+    //File exists and file already has a handle
+    if (v.reverse.get(sub_path)) |handle| {
+        return .{
+            .handle = handle,
+            .flags = .{ .nonblocking = flags.lock_nonblocking },
+        };
+    }
+
+    //File exists but doesnt have a handle
+    const handle = v.newHandle();
+    v.handles.put(handle, hashed_sub_path) catch return error.NoSpaceLeft;
+    return .{
+        .handle = v.newHandle(),
+        .flags = .{ .nonblocking = flags.lock_nonblocking },
+    };
 }
 
 pub fn virtDirClose(userdata: ?*anyopaque, dirs: []const Dir) void {
@@ -583,40 +630,51 @@ pub fn virtFileLength(userdata: ?*anyopaque, file: File) File.LengthError!u64 {
 }
 
 pub fn virtFileClose(userdata: ?*anyopaque, files: []const File) void {
-    _ = userdata;
-    _ = files;
-    unreachable;
+    const v: *Virtualized = @ptrCast(@alignCast(userdata));
+    for(files) |file| {
+        _ = v.handles.remove(file.handle);
+    }
 }
 
 pub fn virtFileWritePositional(userdata: ?*anyopaque, file: File, header: []const u8, data: []const []const u8, splat: usize, offset: u64) File.WritePositionalError!usize {
-    _ = userdata;
-    _ = file;
-    _ = header;
+    const v: *Virtualized = @ptrCast(@alignCast(userdata));
     _ = offset;
-    for (data[0 .. data.len - 1]) |item| {
-        if (item.len > 0) return error.BrokenPipe;
+
+    const filename = v.handles.get(file.handle) orelse return error.BrokenPipe;
+    const array_buf = v.files.getPtr(filename) orelse return error.BrokenPipe;
+
+    const before_size = array_buf.items.len;
+
+    array_buf.appendSlice(v.allocator, header) catch return error.NoSpaceLeft;
+    for (data) |slice| {
+        array_buf.appendSlice(v.allocator, slice) catch return error.NoSpaceLeft;
     }
-    if (data[data.len - 1].len != 0 and splat != 0) return error.BrokenPipe;
-    return 0;
+    for (0..splat) |_| {
+        array_buf.appendSlice(v.allocator, data[data.len - 1]) catch return error.NoSpaceLeft;
+    }
+        
+    const after_size = array_buf.items.len;
+    
+    return after_size - before_size;
 }
 
-pub fn noFileWriteFileStreaming(userdata: ?*anyopaque, file: File, header: []const u8, file_reader: *Io.File.Reader, limit: Io.Limit) File.Writer.WriteFileError!usize {
+pub fn virtFileWriteFileStreaming(userdata: ?*anyopaque, file: File, header: []const u8, file_reader: *Io.File.Reader, limit: Io.Limit) File.Writer.WriteFileError!usize {
     _ = userdata;
-    _ = file;
     _ = header;
+    _ = file;
     _ = file_reader;
     _ = limit;
-    return error.Unimplemented;
+    return File.Writer.WriteFileError.PermissionDenied;
 }
 
-pub fn noFileWriteFilePositional(userdata: ?*anyopaque, file: File, header: []const u8, file_reader: *Io.File.Reader, limit: Io.Limit, offset: u64) File.WriteFilePositionalError!usize {
+pub fn virtFileWriteFilePositional(userdata: ?*anyopaque, file: File, header: []const u8, file_reader: *Io.File.Reader, limit: Io.Limit, offset: u64) File.WriteFilePositionalError!usize {
     _ = userdata;
     _ = file;
     _ = header;
     _ = file_reader;
     _ = limit;
     _ = offset;
-    return error.Unimplemented;
+    return File.WriteFilePositionalError.PermissionDenied;
 }
 
 pub fn virtFileReadPositional(userdata: ?*anyopaque, file: File, data: []const []u8, offset: u64) File.ReadPositionalError!usize {
